@@ -1,35 +1,39 @@
 #include <Arduino.h>
 
-hw_timer_t * timer = NULL;
-// Usamos 'volatile' para que el procesador sepa que esta variable cambia en la ISR
-volatile bool timerInterrumpido = false; 
+const int pinBoton = 14; // Pin donde conectaremos el botón
 
-void IRAM_ATTR onTimer() {
-  timerInterrumpido = true; // Solo levantamos la bandera
+// Variable compartida entre la interrupción y el loop
+// 'volatile' asegura que el valor se lea correctamente desde la RAM
+volatile bool pulsacionDetectada = false;
+
+//Contador
+volatile int contador = 0;
+
+// Función que se ejecuta en la RAM interna
+void IRAM_ATTR isrBoton() {
+  pulsacionDetectada = true;
+  contador++;
 }
 
 void setup() {
-  // 1. Iniciamos la comunicación serial a 115200 baudios
-  Serial.begin(115200); 
+  // Iniciamos la comunicación serial para mostrar mensajes
+  Serial.begin(115200);
   
-  pinMode(2, OUTPUT);
+  // Configuramos el pin con resistencia interna de pull-up 
+  pinMode(pinBoton, INPUT_PULLUP);
+  
+  // attachInterrupt vincula el pin a la función 'isrBoton'
+  // El trigger FALLING detecta al presionar
+  attachInterrupt(digitalPinToInterrupt(pinBoton), isrBoton, FALLING);
 
-  // Configuración del timer (1 segundo)
-  timer = timerBegin(1, 80, true);  // timer 1, divisor 80, countUp
-  timerAttachInterrupt(timer, &onTimer, true);  // true = edge trigger
-  timerAlarmWrite(timer, 1000000, true);  // 1 segundo (1,000,000 µs), autoreload
-  timerAlarmEnable(timer);  // habilitar alarma
-
-  Serial.println("Sistema iniciado. Esperando interrupción...");
+  Serial.println("Sistema listo");
 }
 
 void loop() {
-  // 2. Revisamos si la bandera se levantó
-  if (timerInterrumpido) {
-    timerInterrumpido = false; // Bajamos la bandera
+  // Solo entramos aquí si el hardware detectó el cambio de voltaje
+  if (pulsacionDetectada) {
+    pulsacionDetectada = false; // Bajamos la bandera
     
-    // 3. Ahora sí, imprimimos en consola de forma segura
-    Serial.println("¡Interrupción activada! Ha pasado 1 segundo.");
-    digitalWrite(2, !digitalRead(2)); // Seguimos parpadeando el LED para confirmar
+    Serial.println("Boton presionado" + String(contador));
   }
 }
