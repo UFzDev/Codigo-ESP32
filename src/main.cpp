@@ -1,16 +1,22 @@
 #include <Arduino.h>
 
 const int pinBoton = 14; // Pin donde conectaremos el botón
+const unsigned long debounceUs = 50000; // 50 ms
 
 // Variable compartida entre la interrupción y el loop
 // 'volatile' asegura que el valor se lea correctamente desde la RAM
 volatile bool pulsacionDetectada = false;
-
-//Contador
 volatile int contador = 0;
+volatile unsigned long ultimaInterrupcionUs = 0;
 
 // Función que se ejecuta en la RAM interna
 void IRAM_ATTR isrBoton() {
+  unsigned long ahoraUs = micros();
+  if (ahoraUs - ultimaInterrupcionUs < debounceUs) {
+    return;
+  }
+  ultimaInterrupcionUs = ahoraUs;
+
   pulsacionDetectada = true;
   contador++;
 }
@@ -33,7 +39,11 @@ void loop() {
   // Solo entramos aquí si el hardware detectó el cambio de voltaje
   if (pulsacionDetectada) {
     pulsacionDetectada = false; // Bajamos la bandera
-    
-    Serial.println("Boton presionado" + String(contador));
+
+    noInterrupts();
+    int valorContador = contador;
+    interrupts();
+
+    Serial.println("Boton presionado: " + String(valorContador));
   }
 }
