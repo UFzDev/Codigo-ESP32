@@ -1,6 +1,6 @@
 #include <Arduino.h>
 
-const int pinBoton = 14; // Pin donde conectaremos el botón
+const int pinBoton = 19; // Pin donde conectaremos el botón (D19)
 const unsigned long debounceUs = 50000; // 50 ms
 
 // Variable compartida entre la interrupción y el loop
@@ -24,6 +24,7 @@ void IRAM_ATTR isrBoton() {
 void setup() {
   // Iniciamos la comunicación serial para mostrar mensajes
   Serial.begin(115200);
+  delay(500); // Esperar a que Serial esté listo
   
   // Configuramos el pin con resistencia interna de pull-up 
   pinMode(pinBoton, INPUT_PULLUP);
@@ -40,9 +41,10 @@ void loop() {
   if (pulsacionDetectada) {
     pulsacionDetectada = false; // Bajamos la bandera
 
-    noInterrupts();
+    noInterrupts(); // Deshabilitamos interrupciones para leer el contador de forma segura
     int valorContador = contador;
-    interrupts();
+    contador = 0; // Reiniciar contador a 0
+    interrupts(); // Volvemos a habilitar interrupciones
 
     Serial.println("Boton presionado: " + String(valorContador));
   }
