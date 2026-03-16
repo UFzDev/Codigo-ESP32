@@ -1,7 +1,7 @@
 #include <Arduino.h>
 
 const int pinBoton = 19; // Pin donde conectaremos el botón (D19)
-const int pinLed = 23; // Pin del LED verde
+const int pinLed = 18; // Pin del LED verde
 
 void setup() {
   // Configuramos el LED como salida
