@@ -1,229 +1,158 @@
 #include <Arduino.h>
 #include <Wire.h>
+#include <math.h>
 
+// Pines I2C usados en la ESP32.
 const uint8_t PIN_SDA = 21;
 const uint8_t PIN_SCL = 22;
-const uint8_t ADXL_ADDR_LOW = 0x53;  // SDO to GND
-const uint8_t ADXL_ADDR_HIGH = 0x1D; // SDO to 3V3
-const uint8_t REG_DEVID = 0x00;
-const uint8_t EXPECTED_DEVID = 0xE5;
-const uint8_t REG_BW_RATE = 0x2C;
+
+// Direccion I2C del ADXL345 cuando SDO esta a GND.
+const uint8_t ADXL_ADDR = 0x53;
+
+// Registros principales del ADXL345
 const uint8_t REG_POWER_CTL = 0x2D;
+const uint8_t REG_BW_RATE = 0x2C;
 const uint8_t REG_DATA_FORMAT = 0x31;
 const uint8_t REG_DATAX0 = 0x32;
 
-uint8_t g_adxlAddress = ADXL_ADDR_LOW;
-bool g_sensorReady = false;
+// Parametros de adquisicion y post-procesado.
+const uint32_t SAMPLE_PERIOD_MS = 10;      // 100 Hz
+const float HPF_CUTOFF_HZ = 0.7f;          // Quita gravedad/deriva lenta.
+const uint8_t PRINT_EVERY_N_SAMPLES = 10;  // 10 Hz por Serial.
+const float AXIS_DEADBAND_G = 0.006f;
 
-bool writeRegister(uint8_t address, uint8_t reg, uint8_t value) {
-  Wire.beginTransmission(address);
+// Estado interno del filtro pasa-altas por eje.
+struct HighPassState {
+  float prevInput = 0.0f;
+  float prevOutput = 0.0f;
+  bool initialized = false;
+};
+
+// Estado global del DSP y del planificador de muestreo.
+HighPassState g_hpfX, g_hpfY, g_hpfZ;
+uint32_t g_nextSampleMs = 0;
+uint8_t g_samplesSincePrint = 0;
+
+// Escribe un registro del sensor por I2C.
+bool writeReg(uint8_t reg, uint8_t value) {
+  Wire.beginTransmission(ADXL_ADDR);
   Wire.write(reg);
   Wire.write(value);
   return Wire.endTransmission(true) == 0;
 }
 
-bool readRegister(uint8_t address, uint8_t reg, uint8_t &value) {
-  Wire.beginTransmission(address);
-  Wire.write(reg);
-  // Prefer repeated-start for register reads.
-  uint8_t txErr = Wire.endTransmission(false);
-  if (txErr != 0) {
-    // Fallback for adapters that dislike repeated-start.
-    Wire.beginTransmission(address);
-    Wire.write(reg);
-    if (Wire.endTransmission(true) != 0) {
-      return false;
-    }
-  }
-
-  uint8_t readCount = Wire.requestFrom((int)address, 1, (int)true);
-  if (readCount != 1) {
+// Lee 6 bytes consecutivos (X, Y, Z) desde DATAX0.
+bool readXYZ(int16_t &x, int16_t &y, int16_t &z) {
+  uint8_t d[6] = {0};
+  Wire.beginTransmission(ADXL_ADDR);
+  Wire.write(REG_DATAX0);
+  if (Wire.endTransmission(false) != 0) {
     return false;
   }
-
-  value = Wire.read();
+  if (Wire.requestFrom((int)ADXL_ADDR, 6, (int)true) != 6) {
+    return false;
+  }
+  for (uint8_t i = 0; i < 6; i++) {
+    d[i] = Wire.read();
+  }
+  x = (int16_t)((d[1] << 8) | d[0]);
+  y = (int16_t)((d[3] << 8) | d[2]);
+  z = (int16_t)((d[5] << 8) | d[4]);
   return true;
 }
 
-bool readRegisters(uint8_t address, uint8_t startReg, uint8_t *buffer, uint8_t length) {
-  Wire.beginTransmission(address);
-  Wire.write(startReg);
-  uint8_t txErr = Wire.endTransmission(false);
-  if (txErr != 0) {
-    // Fallback path with STOP.
-    Wire.beginTransmission(address);
-    Wire.write(startReg);
-    if (Wire.endTransmission(true) != 0) {
-      return false;
-    }
+// Filtro pasa-altas de 1er orden para aislar vibracion.
+float highPassFilter(HighPassState &s, float input, float alpha) {
+  if (!s.initialized) {
+    s.prevInput = input;
+    s.prevOutput = 0.0f;
+    s.initialized = true;
+    return 0.0f;
   }
-
-  uint8_t readCount = Wire.requestFrom((int)address, (int)length, (int)true);
-  if (readCount != length) {
-    return false;
-  }
-
-  for (uint8_t i = 0; i < length; i++) {
-    buffer[i] = Wire.read();
-  }
-  return true;
+  const float out = alpha * (s.prevOutput + input - s.prevInput);
+  s.prevInput = input;
+  s.prevOutput = out;
+  return out;
 }
 
-bool detectAdxlAddress(uint8_t &address) {
-  uint8_t devid = 0;
-  if (readRegister(ADXL_ADDR_LOW, REG_DEVID, devid) && devid == EXPECTED_DEVID) {
-    address = ADXL_ADDR_LOW;
-    return true;
-  }
-
-  if (readRegister(ADXL_ADDR_HIGH, REG_DEVID, devid) && devid == EXPECTED_DEVID) {
-    address = ADXL_ADDR_HIGH;
-    return true;
-  }
-
-  return false;
+// Deadband: fuerza a cero valores pequenos para limpiar ruido.
+float deadband(float v, float db) {
+  return (fabsf(v) < db) ? 0.0f : v;
 }
 
-void scanBusBrief() {
-  bool foundAny = false;
-  Serial.print("Escaneo bus: ");
-  for (uint8_t address = 1; address < 127; address++) {
-    Wire.beginTransmission(address);
-    if (Wire.endTransmission(true) == 0) {
-      if (!foundAny) {
-        foundAny = true;
-      }
-      Serial.print("0x");
-      if (address < 16) {
-        Serial.print("0");
-      }
-      Serial.print(address, HEX);
-      Serial.print(" ");
-    }
-  }
-  if (!foundAny) {
-    Serial.print("sin ACK");
-  }
-  Serial.println();
-}
-
-bool initAdxl345(uint8_t address) {
-  // Ensure standby before changing data format/rate.
-  if (!writeRegister(address, REG_POWER_CTL, 0x00)) {
-    return false;
-  }
-
-  // 100 Hz output data rate.
-  if (!writeRegister(address, REG_BW_RATE, 0x0A)) {
-    return false;
-  }
-
-  // Full-resolution mode, +/-2g range.
-  if (!writeRegister(address, REG_DATA_FORMAT, 0x08)) {
-    return false;
-  }
-
-  // Enable measurement mode.
-  if (!writeRegister(address, REG_POWER_CTL, 0x08)) {
-    return false;
-  }
-
-  // Validate configuration by reading back key registers.
-  uint8_t powerCtl = 0;
-  uint8_t dataFormat = 0;
-  if (!readRegister(address, REG_POWER_CTL, powerCtl)) {
-    return false;
-  }
-  if (!readRegister(address, REG_DATA_FORMAT, dataFormat)) {
-    return false;
-  }
-  if ((powerCtl & 0x08) == 0) {
-    return false;
-  }
-  if ((dataFormat & 0x08) == 0) {
-    return false;
-  }
-
-  return true;
-}
-
-bool readAccelerationRaw(uint8_t address, int16_t &x, int16_t &y, int16_t &z) {
-  uint8_t data[6] = {0};
-  if (!readRegisters(address, REG_DATAX0, data, 6)) {
-    return false;
-  }
-
-  x = (int16_t)((data[1] << 8) | data[0]);
-  y = (int16_t)((data[3] << 8) | data[2]);
-  z = (int16_t)((data[5] << 8) | data[4]);
-  return true;
-}
-
-float rawToG(int16_t raw) {
-  // In full-resolution mode ADXL345 sensitivity is ~3.9 mg/LSB.
-  return raw * 0.0039f;
-}
-
-void printAddress(uint8_t address) {
-  Serial.print("0x");
-  if (address < 16) {
-    Serial.print("0");
-  }
-  Serial.print(address, HEX);
+// Reinicia estados de los filtros cuando inicia el sistema.
+void resetFilterState() {
+  g_hpfX = HighPassState{};
+  g_hpfY = HighPassState{};
+  g_hpfZ = HighPassState{};
+  g_samplesSincePrint = 0;
 }
 
 void setup() {
+  // Inicializacion fisica del bus I2C en los pines definidos.
   pinMode(PIN_SDA, INPUT_PULLUP);
   pinMode(PIN_SCL, INPUT_PULLUP);
   Wire.begin(PIN_SDA, PIN_SCL);
   Wire.setClock(100000);
+
+  // Consola serie para monitoreo.
   Serial.begin(115200);
   delay(1000);
+  Serial.println("\nADXL345 fijo en I2C (SDA=21, SCL=22, addr=0x53)");
 
-  Serial.println("\nLectura ADXL345 (I2C)");
-  Serial.println("SDA=21, SCL=22, 100kHz");
-  Serial.println("Buscando sensor...\n");
+  // Configuracion del sensor.
+  if (!writeReg(REG_POWER_CTL, 0x00) ||  // standby
+      !writeReg(REG_BW_RATE, 0x0A) ||    // 100 Hz
+      !writeReg(REG_DATA_FORMAT, 0x08) ||// full-resolution, +/-2g
+      !writeReg(REG_POWER_CTL, 0x08)) {  // measure
+    Serial.println("Error al inicializar ADXL345");
+  } else {
+    Serial.println("ADXL345 listo. Iniciando lectura de vibracion...");
+  }
+
+  g_nextSampleMs = millis();
+  resetFilterState();
 }
 
 void loop() {
-  if (!g_sensorReady) {
-    if (!detectAdxlAddress(g_adxlAddress)) {
-      Serial.println("Esperando sensor ADXL345... (sin comunicacion I2C)");
-      scanBusBrief();
-      delay(1500);
-      return;
-    }
-
-    if (!initAdxl345(g_adxlAddress)) {
-      Serial.println("ADXL345 encontrado pero no inicializa. Reintentando...");
-      delay(1000);
-      return;
-    }
-
-    g_sensorReady = true;
-    Serial.print("ADXL345 detectado en ");
-    printAddress(g_adxlAddress);
-    Serial.println(". Iniciando lectura...\n");
+  // Planificador simple para muestreo periodico a 100 Hz.
+  uint32_t now = millis();
+  if ((int32_t)(now - g_nextSampleMs) < 0) {
+    return;
   }
+  g_nextSampleMs += SAMPLE_PERIOD_MS;
 
-  int16_t xRaw = 0;
-  int16_t yRaw = 0;
-  int16_t zRaw = 0;
-
-  if (!readAccelerationRaw(g_adxlAddress, xRaw, yRaw, zRaw)) {
-    Serial.println("Fallo lectura XYZ. Sensor desconectado? Rebuscando...");
-    g_sensorReady = false;
-    delay(700);
+  // Lectura cruda de aceleracion.
+  int16_t xRaw = 0, yRaw = 0, zRaw = 0;
+  if (!readXYZ(xRaw, yRaw, zRaw)) {
+    Serial.println("Fallo lectura XYZ");
+    delay(50);
     return;
   }
 
-  Serial.print("X: ");
-  Serial.print(rawToG(xRaw), 3);
-  Serial.print(" | Y: ");
-  Serial.print(rawToG(yRaw), 3);
-  Serial.print(" | Z: ");
-  Serial.print(rawToG(zRaw), 3);
-  Serial.println();
+  // Conversion de cuentas del ADC interno del sensor a g.
+  const float xG = xRaw * 0.0039f;
+  const float yG = yRaw * 0.0039f;
+  const float zG = zRaw * 0.0039f;
 
-  delay(300);
+  // Calculo del coeficiente del filtro pasa-altas segun dt y fc.
+  const float dt = SAMPLE_PERIOD_MS / 1000.0f;
+  const float rc = 1.0f / (2.0f * PI * HPF_CUTOFF_HZ);
+  const float alpha = rc / (rc + dt);
+
+  // Filtrado + deadband para obtener vibracion limpia por eje.
+  const float xV = deadband(highPassFilter(g_hpfX, xG, alpha), AXIS_DEADBAND_G);
+  const float yV = deadband(highPassFilter(g_hpfY, yG, alpha), AXIS_DEADBAND_G);
+  const float zV = deadband(highPassFilter(g_hpfZ, zG, alpha), AXIS_DEADBAND_G);
+
+  // Se imprime a 10 Hz para no saturar el puerto serie.
+  if (++g_samplesSincePrint >= PRINT_EVERY_N_SAMPLES) {
+    g_samplesSincePrint = 0;
+    Serial.print("X: ");
+    Serial.print(xV, 3);
+    Serial.print(" | Y: ");
+    Serial.print(yV, 3);
+    Serial.print(" | Z: ");
+    Serial.print(zV, 3);
+  }
 }
