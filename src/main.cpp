@@ -21,28 +21,35 @@ const char *WIFI_AP_SSID = "ESP32_DIPREMO";
 const char *WIFI_AP_PASS = "12345678";  // Minimo 8 caracteres.
 const uint16_t WIFI_TCP_PORT = 3333;
 
+// Identidad del equipo.
+const char *DEVICE_ID = "DIPREMO-001";
+
 // Ajustes de lectura y filtro.
-const uint32_t SAMPLE_PERIOD_MS = 10;      // 100 Hz
-const float HPF_CUTOFF_HZ = 0.7f;          // Quita gravedad/deriva lenta.
-const uint8_t PRINT_EVERY_N_SAMPLES = 10;  // 10 Hz por Serial.
-const float AXIS_DEADBAND_G = 0.006f;
+const uint32_t SAMPLE_PERIOD_MS = 10;  // 100 Hz
+const float SAMPLE_RATE_HZ = 1000.0f / SAMPLE_PERIOD_MS;
 
-// Estado del filtro por cada eje.
-struct HighPassState {
-  float prevInput = 0.0f;
-  float prevOutput = 0.0f;
-  bool initialized = false;
-};
-
-// Variables globales del filtro y del tiempo.
-HighPassState g_hpfX, g_hpfY, g_hpfZ;
+// Variables globales de tiempo y conteo.
 uint32_t g_nextSampleMs = 0;
-uint8_t g_samplesSincePrint = 0;
+uint32_t g_sampleId = 0;
+uint32_t g_prevSampleUs = 0;
+uint32_t g_bootId = 0;
+uint32_t g_i2cErrorCount = 0;
 WiFiServer g_tcpServer(WIFI_TCP_PORT);
 WiFiClient g_tcpClient;
 
+struct VibrationData {
+  // Muestras crudas por eje.
+  int16_t rawX = 0;
+  int16_t rawY = 0;
+  int16_t rawZ = 0;
+};
+
+bool writeReg(uint8_t reg, uint8_t value);
+bool readXYZ(int16_t &x, int16_t &y, int16_t &z);
+void publishLine(const char *line);
+
 // Crea una red WiFi desde el ESP32 y abre un puerto TCP.
-void setupWiFiAp() {
+void setupWiFiAp() {  
   WiFi.mode(WIFI_AP);
   if (!WiFi.softAP(WIFI_AP_SSID, WIFI_AP_PASS)) {
     Serial.println("Error al iniciar AP WiFi");
@@ -50,6 +57,7 @@ void setupWiFiAp() {
   }
 
   const IPAddress ip = WiFi.softAPIP();
+  // Datos de conexion para la PC.
   Serial.print("AP WiFi listo. SSID: ");
   Serial.print(WIFI_AP_SSID);
   Serial.print(" | PASS: ");
@@ -59,6 +67,7 @@ void setupWiFiAp() {
 
   g_tcpServer.begin();
   g_tcpServer.setNoDelay(true);
+  // Puerto donde la PC recibe JSON.
   Serial.print("Servidor TCP activo en puerto ");
   Serial.println(WIFI_TCP_PORT);
 }
@@ -98,6 +107,7 @@ bool writeReg(uint8_t reg, uint8_t value) {
 
 // Lee X, Y y Z del acelerometro.
 bool readXYZ(int16_t &x, int16_t &y, int16_t &z) {
+  // El ADXL345 entrega 6 bytes: X, Y, Z.
   uint8_t d[6] = {0};
   Wire.beginTransmission(ADXL_ADDR);
   Wire.write(REG_DATAX0);
@@ -116,31 +126,55 @@ bool readXYZ(int16_t &x, int16_t &y, int16_t &z) {
   return true;
 }
 
-// Filtro pasa-altas para dejar solo vibracion.
-float highPassFilter(HighPassState &s, float input, float alpha) {
-  if (!s.initialized) {
-    s.prevInput = input;
-    s.prevOutput = 0.0f;
-    s.initialized = true;
-    return 0.0f;
-  }
-  const float out = alpha * (s.prevOutput + input - s.prevInput);
-  s.prevInput = input;
-  s.prevOutput = out;
-  return out;
+// Reinicia estado de tiempo y contador.
+void resetRuntimeState() {
+  g_sampleId = 0;
+  g_i2cErrorCount = 0;
+  g_prevSampleUs = micros();
 }
 
-// Si el valor es muy pequeno, lo deja en cero.
-float deadband(float v, float db) {
-  return (fabsf(v) < db) ? 0.0f : v;
+bool configureAdxl345() {
+  // Configuracion basica para medir a 100 Hz.
+  return writeReg(REG_POWER_CTL, 0x00) &&   // Modo standby significa que se pueden configurar otros registros.
+         writeReg(REG_BW_RATE, 0x0A) &&     // 100 Hz
+         writeReg(REG_DATA_FORMAT, 0x08) && // full-resolution, +/-2g
+         writeReg(REG_POWER_CTL, 0x08);     // Modo medida, empieza a tomar muestras. Este es el ultimo paso, para evitar configuraciones intermedias invalidas.
 }
 
-// Reinicia el estado de los filtros.
-void resetFilterState() {
-  g_hpfX = HighPassState{};
-  g_hpfY = HighPassState{};
-  g_hpfZ = HighPassState{};
-  g_samplesSincePrint = 0;
+bool acquireVibrationData(VibrationData &data) {
+  return readXYZ(data.rawX, data.rawY, data.rawZ);
+}
+
+float computeDeltaMs() {
+  // Tiempo real entre muestra y muestra.
+  const uint32_t nowUs = micros();
+  const float deltaMs = (nowUs - g_prevSampleUs) / 1000.0f;
+  g_prevSampleUs = nowUs;
+  return deltaMs;
+}
+
+void buildJsonLine(const VibrationData &data, float deltaMs, char *out, size_t outSize) {
+  // Diagnostico interno de la placa.
+  const float tempC = temperatureRead();
+  const int32_t rssiDbm = WiFi.RSSI();
+
+  // Paquete JSON que envia la ESP32.
+  snprintf(out,
+           outSize,
+           "{\"device_id\":\"%s\",\"boot_id\":%lu,\"sample_id\":%lu,\"sample_rate_hz\":%.1f,\"uptime_ms\":%lu,\"delta_ms\":%.3f,\"raw\":{\"x\":%d,\"y\":%d,\"z\":%d},\"diag\":{\"temp_c\":%.2f,\"free_heap\":%lu,\"rssi_dbm\":%ld,\"i2c_error_count\":%lu}}",
+           DEVICE_ID,
+           (unsigned long)g_bootId,
+           (unsigned long)g_sampleId,
+           SAMPLE_RATE_HZ,
+           (unsigned long)millis(),
+           deltaMs,
+           data.rawX,
+           data.rawY,
+           data.rawZ,
+           tempC,
+           (unsigned long)ESP.getFreeHeap(),
+           (long)rssiDbm,
+           (unsigned long)g_i2cErrorCount);
 }
 
 void setup() {
@@ -153,13 +187,14 @@ void setup() {
   // Inicia Serial para ver mensajes.
   Serial.begin(115200);
   delay(1000);
+  g_bootId = esp_random();
+  // ID unico por cada reinicio.
   Serial.println("\nADXL345 fijo en I2C (SDA=21, SCL=22, addr=0x53)");
+  Serial.print("Boot ID: ");
+  Serial.println(g_bootId);
 
   // Configura el ADXL345.
-  if (!writeReg(REG_POWER_CTL, 0x00) ||  // standby
-      !writeReg(REG_BW_RATE, 0x0A) ||    // 100 Hz
-      !writeReg(REG_DATA_FORMAT, 0x08) ||// full-resolution, +/-2g
-      !writeReg(REG_POWER_CTL, 0x08)) {  // measure
+  if (!configureAdxl345()) {
     Serial.println("Error al inicializar ADXL345");
   } else {
     Serial.println("ADXL345 listo. Iniciando lectura de vibracion...");
@@ -168,7 +203,7 @@ void setup() {
   setupWiFiAp();
 
   g_nextSampleMs = millis();
-  resetFilterState();
+  resetRuntimeState();
 }
 
 void loop() {
@@ -181,34 +216,21 @@ void loop() {
   }
   g_nextSampleMs += SAMPLE_PERIOD_MS;
 
-  // Lee datos crudos del sensor.
-  int16_t xRaw = 0, yRaw = 0, zRaw = 0;
-  if (!readXYZ(xRaw, yRaw, zRaw)) {
+  VibrationData data;
+  // Si falla I2C, suma error y continua.
+  if (!acquireVibrationData(data)) {
+    g_i2cErrorCount++;
     Serial.println("Fallo lectura XYZ");
     delay(50);
     return;
   }
 
-  // Convierte datos crudos a unidades de g.
-  const float xG = xRaw * 0.0039f;
-  const float yG = yRaw * 0.0039f;
-  const float zG = zRaw * 0.0039f;
+  const float deltaMs = computeDeltaMs();
+  // Contador global de muestras enviadas.
+  g_sampleId++;
 
-  // Calcula el factor del filtro.
-  const float dt = SAMPLE_PERIOD_MS / 1000.0f;
-  const float rc = 1.0f / (2.0f * PI * HPF_CUTOFF_HZ);
-  const float alpha = rc / (rc + dt);
-
-  // Filtra ruido y deja vibracion por eje.
-  const float xV = deadband(highPassFilter(g_hpfX, xG, alpha), AXIS_DEADBAND_G);
-  const float yV = deadband(highPassFilter(g_hpfY, yG, alpha), AXIS_DEADBAND_G);
-  const float zV = deadband(highPassFilter(g_hpfZ, zG, alpha), AXIS_DEADBAND_G);
-
-  // Envia datos 10 veces por segundo.
-  if (++g_samplesSincePrint >= PRINT_EVERY_N_SAMPLES) {
-    g_samplesSincePrint = 0;
-    char line[96] = {0};
-    snprintf(line, sizeof(line), "X: %.3f | Y: %.3f | Z: %.3f", xV, yV, zV);
-    publishLine(line);
-  }
+  // Envia todas las muestras (100 Hz).
+  char line[320] = {0};
+  buildJsonLine(data, deltaMs, line, sizeof(line));
+  publishLine(line);
 }
