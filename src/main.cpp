@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <WiFi.h>
+#include <WebSocketsServer.h>
 #include <math.h>
 
 // Pines I2C del ESP32.
@@ -19,7 +20,7 @@ const uint8_t REG_DATAX0 = 0x32;
 // WiFi en modo punto de acceso para mandar datos sin cable.
 const char *WIFI_AP_SSID = "ESP32_DIPREMO";
 const char *WIFI_AP_PASS = "12345678";  // Minimo 8 caracteres.
-const uint16_t WIFI_TCP_PORT = 3333;
+const uint16_t WIFI_WS_PORT = 81;
 
 // Identidad del equipo.
 const char *DEVICE_ID = "DIPREMO-001";
@@ -34,8 +35,7 @@ uint32_t g_sampleId = 0;
 uint32_t g_prevSampleUs = 0;
 uint32_t g_bootId = 0;
 uint32_t g_i2cErrorCount = 0;
-WiFiServer g_tcpServer(WIFI_TCP_PORT);
-WiFiClient g_tcpClient;
+WebSocketsServer g_wsServer(WIFI_WS_PORT);
 
 struct VibrationData {
   // Muestras crudas por eje.
@@ -47,6 +47,7 @@ struct VibrationData {
 bool writeReg(uint8_t reg, uint8_t value);
 bool readXYZ(int16_t &x, int16_t &y, int16_t &z);
 void publishLine(const char *line);
+void onWebSocketEvent(uint8_t clientNum, WStype_t type, uint8_t *payload, size_t length);
 
 // Crea una red WiFi desde el ESP32 y abre un puerto TCP.
 void setupWiFiAp() {  
@@ -65,35 +66,37 @@ void setupWiFiAp() {
   Serial.print(" | IP ESP32: ");
   Serial.println(ip);
 
-  g_tcpServer.begin();
-  g_tcpServer.setNoDelay(true);
-  // Puerto donde la PC recibe JSON.
-  Serial.print("Servidor TCP activo en puerto ");
-  Serial.println(WIFI_TCP_PORT);
-}
-
-// Mantiene un cliente TCP conectado (solo uno a la vez).
-void handleTcpClient() {
-  if (g_tcpClient && g_tcpClient.connected()) {
-    return;
-  }
-
-  if (g_tcpClient) {
-    g_tcpClient.stop();
-  }
-
-  WiFiClient candidate = g_tcpServer.available();
-  if (candidate) {
-    g_tcpClient = candidate;
-    Serial.println("Cliente TCP conectado");
-  }
+  g_wsServer.begin();
+  g_wsServer.onEvent(onWebSocketEvent);
+  // URL para cliente web: ws://192.168.4.1:81
+  Serial.print("Servidor WebSocket activo en puerto ");
+  Serial.println(WIFI_WS_PORT);
 }
 
 // Envia una linea por Serial y por WiFi.
 void publishLine(const char *line) {
   Serial.println(line);
-  if (g_tcpClient && g_tcpClient.connected()) {
-    g_tcpClient.println(line);
+  g_wsServer.broadcastTXT((uint8_t *)line, strlen(line));
+}
+
+// Log basico de conexiones WebSocket.
+void onWebSocketEvent(uint8_t clientNum, WStype_t type, uint8_t *payload, size_t length) {
+  (void)payload;
+  (void)length;
+
+  switch (type) {
+    case WStype_CONNECTED: {
+      IPAddress ip = g_wsServer.remoteIP(clientNum);
+      Serial.printf("Cliente WS #%u conectado desde %u.%u.%u.%u\n",
+                    clientNum,
+                    ip[0], ip[1], ip[2], ip[3]);
+      break;
+    }
+    case WStype_DISCONNECTED:
+      Serial.printf("Cliente WS #%u desconectado\n", clientNum);
+      break;
+    default:
+      break;
   }
 }
 
@@ -207,7 +210,8 @@ void setup() {
 }
 
 void loop() {
-  handleTcpClient();
+  // Procesa handshakes y trafico WebSocket.
+  g_wsServer.loop();
 
   // Lee el sensor cada 10 ms (100 Hz).
   uint32_t now = millis();
